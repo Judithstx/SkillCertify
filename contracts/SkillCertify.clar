@@ -1,5 +1,5 @@
 ;; SkillCertify - Decentralized Professional Certification Platform
-;; A smart contract for issuing and verifying professional certifications with multi-signature support
+;; A smart contract for issuing and verifying professional certifications with multi-signature support and renewal system
 
 ;; Constants
 (define-constant CONTRACT_OWNER tx-sender)
@@ -11,6 +11,10 @@
 (define-constant ERR_INSUFFICIENT_SIGNATURES (err u411))
 (define-constant ERR_ALREADY_SIGNED (err u412))
 (define-constant ERR_PROPOSAL_EXPIRED (err u413))
+(define-constant ERR_INSUFFICIENT_PAYMENT (err u414))
+(define-constant ERR_RENEWAL_NOT_ELIGIBLE (err u415))
+(define-constant ERR_INSUFFICIENT_CE_CREDITS (err u416))
+(define-constant ERR_RENEWAL_TOO_EARLY (err u417))
 
 ;; Certification levels
 (define-constant LEVEL_BASIC u1)
@@ -24,10 +28,27 @@
 (define-constant ADVANCED_REQUIRED_SIGNATURES u2)
 (define-constant EXPERT_REQUIRED_SIGNATURES u3)
 
+;; Renewal fee constants (in microSTX)
+(define-constant BASIC_RENEWAL_FEE u1000000) ;; 1 STX
+(define-constant INTERMEDIATE_RENEWAL_FEE u2000000) ;; 2 STX
+(define-constant ADVANCED_RENEWAL_FEE u3000000) ;; 3 STX
+(define-constant EXPERT_RENEWAL_FEE u5000000) ;; 5 STX
+
+;; CE (Continuing Education) requirements by level
+(define-constant BASIC_CE_REQUIRED u10) ;; 10 CE credits
+(define-constant INTERMEDIATE_CE_REQUIRED u15) ;; 15 CE credits
+(define-constant ADVANCED_CE_REQUIRED u20) ;; 20 CE credits
+(define-constant EXPERT_CE_REQUIRED u30) ;; 30 CE credits
+
+;; Renewal eligibility window (blocks before expiry)
+(define-constant RENEWAL_WINDOW u4320) ;; ~30 days before expiry
+
 ;; Data Variables
 (define-data-var next-cert-id uint u1)
 (define-data-var next-proposal-id uint u1)
+(define-data-var next-renewal-id uint u1)
 (define-data-var total-certified-professionals uint u0)
+(define-data-var contract-treasury uint u0)
 
 ;; Data Maps
 (define-map certifications
@@ -41,7 +62,9 @@
     issue-date: uint,
     expiry-date: uint,
     verified: bool,
-    metadata-uri: (string-ascii 200)
+    metadata-uri: (string-ascii 200),
+    renewal-count: uint,
+    last-renewal-date: (optional uint)
   }
 )
 
@@ -61,7 +84,8 @@
     name: (string-ascii 100),
     total-certifications: uint,
     active-certifications: uint,
-    profile-created: uint
+    profile-created: uint,
+    total-ce-credits: uint
   }
 )
 
@@ -103,6 +127,45 @@
     has-signed: bool,
     signature-date: uint
   }
+)
+
+;; Renewal system maps
+(define-map renewal-requests
+  { renewal-id: uint }
+  {
+    cert-id: uint,
+    holder: principal,
+    renewal-fee-paid: uint,
+    ce-credits-earned: uint,
+    request-date: uint,
+    status: (string-ascii 20),
+    metadata-uri: (string-ascii 200)
+  }
+)
+
+(define-map continuing-education
+  { holder: principal, cert-id: uint }
+  {
+    total-credits: uint,
+    last-updated: uint,
+    credits-since-renewal: uint
+  }
+)
+
+(define-map ce-activities
+  { holder: principal, activity-id: uint }
+  {
+    activity-name: (string-ascii 100),
+    credits-earned: uint,
+    completion-date: uint,
+    verification-uri: (string-ascii 200),
+    verified: bool
+  }
+)
+
+(define-map holder-ce-activity-count
+  { holder: principal }
+  { count: uint }
 )
 
 ;; Public Functions
@@ -194,6 +257,40 @@
   )
 )
 
+;; Get renewal fee for certification level
+(define-private (get-renewal-fee (level uint))
+  (if (is-eq level LEVEL_BASIC)
+    BASIC_RENEWAL_FEE
+    (if (is-eq level LEVEL_INTERMEDIATE)
+      INTERMEDIATE_RENEWAL_FEE
+      (if (is-eq level LEVEL_ADVANCED)
+        ADVANCED_RENEWAL_FEE
+        (if (is-eq level LEVEL_EXPERT)
+          EXPERT_RENEWAL_FEE
+          BASIC_RENEWAL_FEE
+        )
+      )
+    )
+  )
+)
+
+;; Get required CE credits for certification level
+(define-private (get-required-ce-credits (level uint))
+  (if (is-eq level LEVEL_BASIC)
+    BASIC_CE_REQUIRED
+    (if (is-eq level LEVEL_INTERMEDIATE)
+      INTERMEDIATE_CE_REQUIRED
+      (if (is-eq level LEVEL_ADVANCED)
+        ADVANCED_CE_REQUIRED
+        (if (is-eq level LEVEL_EXPERT)
+          EXPERT_CE_REQUIRED
+          BASIC_CE_REQUIRED
+        )
+      )
+    )
+  )
+)
+
 ;; Issue a certification (for basic/intermediate) or create proposal (for advanced/expert)
 (define-public (issue-certification 
   (holder principal)
@@ -262,7 +359,9 @@
         issue-date: current-height,
         expiry-date: expiry-date,
         verified: true,
-        metadata-uri: metadata-uri
+        metadata-uri: metadata-uri,
+        renewal-count: u0,
+        last-renewal-date: none
       }
     )
     
@@ -270,6 +369,16 @@
     (map-set holder-certifications
       { holder: holder, cert-id: cert-id }
       { exists: true }
+    )
+    
+    ;; Initialize CE tracking for the certification
+    (map-set continuing-education
+      { holder: holder, cert-id: cert-id }
+      {
+        total-credits: u0,
+        last-updated: current-height,
+        credits-since-renewal: u0
+      }
     )
     
     ;; Update issuer stats
@@ -298,7 +407,8 @@
           name: "",
           total-certifications: u1,
           active-certifications: u1,
-          profile-created: stacks-block-height
+          profile-created: stacks-block-height,
+          total-ce-credits: u0
         }
       )
     )
@@ -447,6 +557,243 @@
   )
 )
 
+;; Add continuing education activity
+(define-public (add-ce-activity
+  (activity-name (string-ascii 100))
+  (credits-earned uint)
+  (verification-uri (string-ascii 200)))
+  
+  (let (
+    (holder tx-sender)
+    (current-height stacks-block-height)
+    (activity-count (default-to u0 (get count (map-get? holder-ce-activity-count { holder: holder }))))
+    (activity-id (+ activity-count u1))
+  )
+    ;; Validate inputs
+    (asserts! (> (len activity-name) u0) ERR_INVALID_INPUT)
+    (asserts! (> credits-earned u0) ERR_INVALID_INPUT)
+    (asserts! (> (len verification-uri) u0) ERR_INVALID_INPUT)
+    (asserts! (<= credits-earned u50) ERR_INVALID_INPUT) ;; Max 50 credits per activity
+    
+    ;; Add CE activity
+    (map-set ce-activities
+      { holder: holder, activity-id: activity-id }
+      {
+        activity-name: activity-name,
+        credits-earned: credits-earned,
+        completion-date: current-height,
+        verification-uri: verification-uri,
+        verified: true ;; Auto-verified for now, could require issuer verification
+      }
+    )
+    
+    ;; Update activity count
+    (map-set holder-ce-activity-count
+      { holder: holder }
+      { count: activity-id }
+    )
+    
+    ;; Update professional profile with total CE credits
+    (match (map-get? professional-profiles { holder: holder })
+      profile-data
+      (map-set professional-profiles
+        { holder: holder }
+        (merge profile-data { total-ce-credits: (+ (get total-ce-credits profile-data) credits-earned) })
+      )
+      ;; Create profile if doesn't exist
+      (map-set professional-profiles
+        { holder: holder }
+        {
+          name: "",
+          total-certifications: u0,
+          active-certifications: u0,
+          profile-created: current-height,
+          total-ce-credits: credits-earned
+        }
+      )
+    )
+    
+    (ok activity-id)
+  )
+)
+
+;; Request certification renewal
+(define-public (request-certification-renewal
+  (cert-id uint)
+  (metadata-uri (string-ascii 200)))
+  
+  (let (
+    (holder tx-sender)
+    (current-height stacks-block-height)
+    (renewal-id (var-get next-renewal-id))
+  )
+    ;; Validate inputs
+    (asserts! (> cert-id u0) ERR_INVALID_INPUT)
+    (asserts! (< cert-id (var-get next-cert-id)) ERR_NOT_FOUND)
+    (asserts! (> (len metadata-uri) u0) ERR_INVALID_INPUT)
+    
+    ;; Get certification data
+    (match (map-get? certifications { cert-id: cert-id })
+      cert-data
+      (begin
+        ;; Verify holder owns the certification
+        (asserts! (is-eq (get holder cert-data) holder) ERR_UNAUTHORIZED)
+        
+        ;; Check if certification is within renewal window
+        (let ((time-to-expiry (- (get expiry-date cert-data) current-height)))
+          (asserts! (<= time-to-expiry RENEWAL_WINDOW) ERR_RENEWAL_TOO_EARLY)
+          
+          ;; Check if certification is not yet expired
+          (asserts! (> (get expiry-date cert-data) current-height) ERR_EXPIRED)
+          
+          (let (
+            (cert-level (get certification-level cert-data))
+            (renewal-fee (get-renewal-fee cert-level))
+            (required-ce (get-required-ce-credits cert-level))
+          )
+            ;; Get CE credits for this certification
+            (let (
+              (ce-data (default-to 
+                { total-credits: u0, last-updated: u0, credits-since-renewal: u0 }
+                (map-get? continuing-education { holder: holder, cert-id: cert-id })
+              ))
+              (available-credits (get credits-since-renewal ce-data))
+            )
+              ;; Check CE requirements
+              (asserts! (>= available-credits required-ce) ERR_INSUFFICIENT_CE_CREDITS)
+              
+              ;; Transfer renewal fee to contract
+              (try! (stx-transfer? renewal-fee holder (as-contract tx-sender)))
+              
+              ;; Create renewal request
+              (map-set renewal-requests
+                { renewal-id: renewal-id }
+                {
+                  cert-id: cert-id,
+                  holder: holder,
+                  renewal-fee-paid: renewal-fee,
+                  ce-credits-earned: available-credits,
+                  request-date: current-height,
+                  status: "approved", ;; Auto-approve if requirements met
+                  metadata-uri: metadata-uri
+                }
+              )
+              
+              ;; Process the renewal immediately
+              (try! (process-renewal renewal-id))
+              
+              ;; Update treasury
+              (var-set contract-treasury (+ (var-get contract-treasury) renewal-fee))
+              
+              ;; Increment renewal ID
+              (var-set next-renewal-id (+ renewal-id u1))
+              
+              (ok renewal-id)
+            )
+          )
+        )
+      )
+      ERR_NOT_FOUND
+    )
+  )
+)
+
+;; Process approved renewal (private function)
+(define-private (process-renewal (renewal-id uint))
+  (match (map-get? renewal-requests { renewal-id: renewal-id })
+    renewal-data
+    (begin
+      (let (
+        (cert-id (get cert-id renewal-data))
+        (holder (get holder renewal-data))
+        (current-height stacks-block-height)
+      )
+        ;; Get certification data
+        (match (map-get? certifications { cert-id: cert-id })
+          cert-data
+          (let (
+            (validity-period (- (get expiry-date cert-data) (get issue-date cert-data)))
+            (new-expiry (+ current-height validity-period))
+          )
+            ;; Update certification with new expiry date and renewal info
+            (map-set certifications
+              { cert-id: cert-id }
+              (merge cert-data {
+                expiry-date: new-expiry,
+                renewal-count: (+ (get renewal-count cert-data) u1),
+                last-renewal-date: (some current-height)
+              })
+            )
+            
+            ;; Reset CE credits counter for this certification
+            (match (map-get? continuing-education { holder: holder, cert-id: cert-id })
+              ce-data
+              (map-set continuing-education
+                { holder: holder, cert-id: cert-id }
+                (merge ce-data {
+                  credits-since-renewal: u0,
+                  last-updated: current-height
+                })
+              )
+              false ;; Should not happen
+            )
+            
+            (ok true)
+          )
+          ERR_NOT_FOUND
+        )
+      )
+    )
+    ERR_NOT_FOUND
+  )
+)
+
+;; Update CE credits for a specific certification
+(define-public (update-ce-credits-for-cert (cert-id uint) (credits-to-add uint))
+  (let (
+    (holder tx-sender)
+    (current-height stacks-block-height)
+  )
+    ;; Validate inputs
+    (asserts! (> cert-id u0) ERR_INVALID_INPUT)
+    (asserts! (< cert-id (var-get next-cert-id)) ERR_NOT_FOUND)
+    (asserts! (> credits-to-add u0) ERR_INVALID_INPUT)
+    (asserts! (<= credits-to-add u100) ERR_INVALID_INPUT) ;; Max 100 credits at once
+    
+    ;; Verify holder owns the certification
+    (match (map-get? certifications { cert-id: cert-id })
+      cert-data
+      (begin
+        (asserts! (is-eq (get holder cert-data) holder) ERR_UNAUTHORIZED)
+        
+        ;; Update CE credits
+        (match (map-get? continuing-education { holder: holder, cert-id: cert-id })
+          ce-data
+          (map-set continuing-education
+            { holder: holder, cert-id: cert-id }
+            (merge ce-data {
+              total-credits: (+ (get total-credits ce-data) credits-to-add),
+              credits-since-renewal: (+ (get credits-since-renewal ce-data) credits-to-add),
+              last-updated: current-height
+            })
+          )
+          ;; Create new CE tracking if doesn't exist
+          (map-set continuing-education
+            { holder: holder, cert-id: cert-id }
+            {
+              total-credits: credits-to-add,
+              last-updated: current-height,
+              credits-since-renewal: credits-to-add
+            }
+          )
+        )
+        (ok true)
+      )
+      ERR_UNAUTHORIZED
+    )
+  )
+)
+
 ;; Update professional profile
 (define-public (update-profile (name (string-ascii 100)))
   (let ((holder tx-sender))
@@ -468,7 +815,8 @@
             name: name,
             total-certifications: u0,
             active-certifications: u0,
-            profile-created: stacks-block-height
+            profile-created: stacks-block-height,
+            total-ce-credits: u0
           }
         )
         (ok true)
@@ -495,10 +843,70 @@
       skill-category: (get skill-category cert-data),
       certification-name: (get certification-name cert-data),
       certification-level: (get certification-level cert-data),
-      expires-at: (get expiry-date cert-data)
+      expires-at: (get expiry-date cert-data),
+      renewal-count: (get renewal-count cert-data)
     })
     ERR_NOT_FOUND
   )
+)
+
+;; Check renewal eligibility
+(define-read-only (check-renewal-eligibility (cert-id uint))
+  (match (map-get? certifications { cert-id: cert-id })
+    cert-data
+    (let (
+      (current-height stacks-block-height)
+      (time-to-expiry (- (get expiry-date cert-data) current-height))
+      (cert-level (get certification-level cert-data))
+      (required-ce (get-required-ce-credits cert-level))
+      (renewal-fee (get-renewal-fee cert-level))
+      (holder (get holder cert-data))
+    )
+      ;; Get CE credits for this certification
+      (let (
+        (ce-data (default-to 
+          { total-credits: u0, last-updated: u0, credits-since-renewal: u0 }
+          (map-get? continuing-education { holder: holder, cert-id: cert-id })
+        ))
+        (available-credits (get credits-since-renewal ce-data))
+      )
+        (ok {
+          eligible: (and 
+            (<= time-to-expiry RENEWAL_WINDOW)
+            (> (get expiry-date cert-data) current-height)
+            (>= available-credits required-ce)
+          ),
+          time-to-expiry: time-to-expiry,
+          renewal-window: RENEWAL_WINDOW,
+          required-ce-credits: required-ce,
+          available-ce-credits: available-credits,
+          renewal-fee: renewal-fee,
+          is-expired: (<= (get expiry-date cert-data) current-height)
+        })
+      )
+    )
+    ERR_NOT_FOUND
+  )
+)
+
+;; Get renewal request details
+(define-read-only (get-renewal-request (renewal-id uint))
+  (map-get? renewal-requests { renewal-id: renewal-id })
+)
+
+;; Get CE credits for a certification
+(define-read-only (get-ce-credits (holder principal) (cert-id uint))
+  (map-get? continuing-education { holder: holder, cert-id: cert-id })
+)
+
+;; Get CE activity details
+(define-read-only (get-ce-activity (holder principal) (activity-id uint))
+  (map-get? ce-activities { holder: holder, activity-id: activity-id })
+)
+
+;; Get total CE activities count for holder
+(define-read-only (get-ce-activity-count (holder principal))
+  (default-to u0 (get count (map-get? holder-ce-activity-count { holder: holder })))
 )
 
 ;; Get certification proposal details
@@ -534,11 +942,28 @@
   (is-some (map-get? holder-certifications { holder: holder, cert-id: cert-id }))
 )
 
+;; Get renewal fee for certification level (read-only)
+(define-read-only (get-renewal-fee-for-level (level uint))
+  (get-renewal-fee level)
+)
+
+;; Get required CE credits for certification level (read-only)
+(define-read-only (get-required-ce-for-level (level uint))
+  (get-required-ce-credits level)
+)
+
+;; Get contract treasury balance
+(define-read-only (get-contract-treasury)
+  (var-get contract-treasury)
+)
+
 ;; Get contract statistics
 (define-read-only (get-contract-stats)
   (ok {
     total-certifications: (- (var-get next-cert-id) u1),
     total-certified-professionals: (var-get total-certified-professionals),
-    total-proposals: (- (var-get next-proposal-id) u1)
+    total-proposals: (- (var-get next-proposal-id) u1),
+    total-renewals: (- (var-get next-renewal-id) u1),
+    contract-treasury: (var-get contract-treasury)
   })
 )
